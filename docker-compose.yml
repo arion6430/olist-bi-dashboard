@@ -1,0 +1,124 @@
+x-superset-build: &superset-build
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+x-superset-env: &superset-env
+  SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+  SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@superset-db:5432/${POSTGRES_DB}
+  REDIS_HOST: superset-redis
+  REDIS_PORT: "6379"
+
+x-superset-volumes: &superset-volumes
+  - ./superset_config.py:/app/pythonpath/superset_config.py:ro
+  - superset-home:/app/superset_home
+
+services:
+  superset-db:
+    image: postgres:16-alpine
+    container_name: superset-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - superset-db-volume:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  superset-redis:
+    image: redis:7-alpine
+    container_name: superset-redis
+    restart: unless-stopped
+    volumes:
+      - superset-redis-volume:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  superset-init:
+    <<: *superset-build
+    container_name: superset-init
+    depends_on:
+      superset-db:
+        condition: service_healthy
+      superset-redis:
+        condition: service_healthy
+    environment:
+      <<: *superset-env
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_FIRSTNAME: ${ADMIN_FIRSTNAME}
+      ADMIN_LASTNAME: ${ADMIN_LASTNAME}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./init.sh:/app/init.sh:ro
+      - superset-home:/app/superset_home
+    command: ["bash", "/app/init.sh"]
+    restart: on-failure
+
+  superset:
+    <<: *superset-build
+    container_name: superset
+    restart: unless-stopped
+    depends_on:
+      superset-db:
+        condition: service_healthy
+      superset-redis:
+        condition: service_healthy
+    environment:
+      <<: *superset-env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8088:8088"
+    volumes: *superset-volumes
+    command: ["gunicorn", "-w", "4", "-k", "gevent", "--timeout", "120", "-b", "0.0.0.0:8088", "--limit-request-line", "0", "--limit-request-field_size", "0", "superset.app:create_app()"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  superset-worker:
+    <<: *superset-build
+    container_name: superset-worker
+    restart: unless-stopped
+    depends_on:
+      superset-db:
+        condition: service_healthy
+      superset-redis:
+        condition: service_healthy
+    environment:
+      <<: *superset-env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes: *superset-volumes
+    command: ["celery", "--app=superset.tasks.celery_app:app", "worker", "--loglevel=info", "-O", "fair"]
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A superset.tasks.celery_app:app inspect ping --timeout 5 | grep -q 'pong'"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  superset-db-volume:
+  superset-redis-volume:
+  superset-home:
+
+networks:
+  default:
+    name: superset-network
